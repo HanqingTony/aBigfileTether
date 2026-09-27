@@ -864,6 +864,9 @@ pub fn run_agent(default_repo: Option<PathBuf>) -> Result<()> {
         },
     )?;
 
+    // 索引缓存：会话内不变。Get 用它取哈希，省掉"发送前先整读一遍"的重复读。
+    let index = shadowmod::load_index(&repo)?;
+
     loop {
         let req: Request = match recv(&mut r) {
             Ok(req) => req,
@@ -875,13 +878,12 @@ pub fn run_agent(default_repo: Option<PathBuf>) -> Result<()> {
         }
         let result: Result<()> = (|| match req {
             Request::ListIndex => {
-                let index = shadowmod::load_index(&repo)?;
                 let entries = index
-                    .into_iter()
+                    .iter()
                     .map(|(rel, s)| IndexEntry {
-                        path: path_to_bytes(&rel),
+                        path: path_to_bytes(rel),
                         size: s.size,
-                        hash: s.content_hash,
+                        hash: s.content_hash.clone(),
                     })
                     .collect();
                 send(&mut w, &Response::Index { entries })?;
@@ -905,7 +907,8 @@ pub fn run_agent(default_repo: Option<PathBuf>) -> Result<()> {
                 Ok(())
             }
             Request::Get { path, offset } => {
-                let src = real.join(safe_rel(&path)?);
+                let rel = safe_rel(&path)?;
+                let src = real.join(&rel);
                 let md = fs::metadata(&src)
                     .with_context(|| format!("对端缺少文件：{}", src.display()))?;
                 if offset > md.len() {
@@ -917,7 +920,10 @@ pub fn run_agent(default_repo: Option<PathBuf>) -> Result<()> {
                     )?;
                     return Ok(());
                 }
-                let digest = hash::blake3_file(&src)?;
+                let digest = match index.get(&rel) {
+                    Some(s) => s.content_hash.clone(),
+                    None => hash::blake3_file(&src)?,
+                };
                 send(
                     &mut w,
                     &Response::Started {
