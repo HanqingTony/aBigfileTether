@@ -70,6 +70,12 @@ label = "zmain-hdd"
 [peers]
 # 对等端 = 对端的 tether 仓库（agent 会读取其 tether.toml 得到对端真实路径）
 zmain = "tony@192.168.0.102:/home/tony/zrepo/tether-zext"
+
+[transfer]
+# 传输后端：system-ssh（默认）或 russh（需 `cargo build --features russh`）
+backend = "system-ssh"
+# key = "~/.ssh/id_ed25519"                    # russh 后端用的私钥
+# remote_bin = "/home/tony/.local/bin/tether"  # 对端 tether 路径（默认走 PATH 的 tether）
 ```
 
 ---
@@ -175,11 +181,12 @@ diff   = tree_diff(base, target)
 
 ### 5.3 传输（自研协议，取代 rsync）
 
-**通道**：SSH 只当字节管道。客户端连接对端 sshd，执行固定远端命令
-`ssh -o BatchMode=yes <host> -- tether agent`（**命令行不含任何用户路径**）；
-仓库路径由首个 `Hello` 消息经协议传给 agent，agent 再读自己的 `tether.toml`
-得到真实路径。这样彻底规避 shell 转义问题。**对端需在 PATH 上有 `tether`**。
-纯 Rust `russh` 客户端作为后续可选（当前用系统 `ssh`）。
+**通道**：传输后端可插拔（`Connection` 抽象）。默认系统 `ssh`：客户端连接对端 sshd，
+执行固定远端命令 `ssh -o BatchMode=yes <host> -- tether agent`（**命令行不含任何用户
+路径**）；仓库路径由首个 `Hello` 消息经协议传给 agent，agent 再读自己的 `tether.toml`
+得到真实路径。这样彻底规避 shell 转义问题。可选纯 Rust `russh` 后端（`--features
+russh` + `[transfer] backend="russh"`），以私钥认证，行为/日志同样可控。
+**对端需在 PATH 上有 `tether`。**
 
 **分帧**：二进制帧（`postcard`/`bincode`），其中 `path` 是长度前缀的原始字节
 （`Vec<u8>`），天然支持空格 / 中文 / `[` / 任意字节，无需转义。
@@ -188,8 +195,9 @@ diff   = tree_diff(base, target)
 
 - push 前先向对端 `HAVE(hash, size)`；对端若在**别的路径**已有同 hash → 只发
   `MOVE`，**零字节传输**；否则才 `PUT`。
-- 大文件：分块、`pwrite` 定位、**断点续传**（offset）、写 `.part` 后原子改名、
-  收发两端流式算 blake3 校验。数十 GB 文件可断可续。
+- 大文件：流式传输 + **断点续传**（按字节 offset）；未完成内容写 `.part`，校验通过
+  后原子改名；收发两端流式算 blake3 校验。续传时本地重读已存在前缀以恢复哈希状态
+  （只读本地磁盘，不重传网络）。数十 GB 文件可断可续。（并行/分块并发传输暂未做。）
 
 **统一日志**：本地与远端 agent 发出同一套结构化事件（`INFO/WARN/PROGRESS/ERROR`
 + `key=value`），客户端统一渲染；`--log-json` 可机读。这是取代 rsync 日志的主要动机。
@@ -211,17 +219,22 @@ diff   = tree_diff(base, target)
 ## 6. CLI 草案
 
 ```
-tether init <repo> --path <real>        # 初始化仓库/本地配置
-tether scan [--yes] [--log-json]        # 真实 → 仓库（默认展示计划）
-tether apply [--to <ref>] [--prune] [-n]  # 仓库 → 真实（默认 dry-run）
-tether status                           # 展示真实与影子树的差异
-tether cert [--verify]                  # 生成/校验证书与 root_hash
-tether pull --from <peer> [--prune]     # 从对端补齐本快照缺失的字节
-tether push --to <peer> [--prune]       # 把本快照推给对端（哈希感知，只传新字节）
-tether agent                            # 远端被 ssh 调用，走 stdio 协议（内部）
+tether init <real> [--repo <repo>]       # 初始化仓库/本地配置
+tether scan [--yes] [--log-json]         # 真实 → 仓库（默认展示计划）
+tether apply [--to <ref>] [--prune] [--yes]  # 仓库 → 真实（默认 dry-run）
+tether status                            # 展示真实与影子树的差异
+tether reorg --map <file> [--real] [--yes]   # 按已知映射移动影子（可选真实），零哈希
+tether propagate --from <ref> [--onto <ref>] [--yes]  # 并回 A/M/R，丢弃 D
+tether cert [--verify]                   # 生成/校验证书与 root_hash
+tether pull --from <peer> [--prune]      # 从对端补齐本快照缺失的字节
+tether push --to <peer> [--prune]        # 把本快照推给对端（哈希感知，只传新字节）
+tether agent [--repo <repo>]             # 远端被 ssh 调用，走 stdio 协议（内部）
 ```
 
 所有命令支持 `-h/--help`。
+
+**整理目录结构时用 `reorg`（元数据优先、零哈希），不要"先动真实再 scan"**——后者会为每个新
+路径重新哈希全部内容。`reorg` 按已知映射 `git mv` 影子（`--real` 同时移动真实文件）。
 
 ---
 
@@ -246,13 +259,13 @@ tether agent                            # 远端被 ssh 调用，走 stdio 协�
 
 - Rust，edition 2024（本机 rustc 1.98）。
 - 依赖候选：`clap`(CLI)、`blake3`(哈希)、`serde`+`toml`(模型)、`walkdir`(遍历)、
-  `ignore`(排除规则)、`rayon`(并行哈希)、`anyhow`/`thiserror`(错误)、
-  `russh`(SSH 传输，待 spike 验证)。
+  `ignore`(排除规则)、`rayon`(并行哈希)、`anyhow`(错误)、`bincode`(协议帧)；
+  `russh`+`tokio` 为**可选**（`--features russh`）的纯 Rust SSH 后端。
 - 跨平台：无 inode、无权限位、无 POSIX 专属路径假设；路径按 OS 原生字节处理。
 
 ## 9. 待定 / 后续
 
-- 传输 SSH 库 spike（`russh` vs 系统 `ssh` 管道）。
+- 并行传输、单文件分块并发（当前为单流按 offset 续传）。
 - `apply` 遇到"真实与目标不一致"的冲突策略细化。
-- 多对等端、部分传输、并发/限速。
+- 多对等端、限速。
 - 未来作为整个资料库的底层基建时的扩展点（保留设计余地，但当前不做多根）。

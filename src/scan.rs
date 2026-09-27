@@ -225,17 +225,13 @@ pub fn scan(repo: &Path, real: &Path, commit: bool) -> Result<ScanReport> {
     }
 
     // ---------- Git 提交（连同脚手架文件，确保 .tetherignore/.gitignore 入库） ----------
-    git::run(
-        repo,
-        &[
-            "add",
-            "--all",
-            "--",
-            shadowmod::MIRROR_DIR,
-            crate::config::IGNORE_NAME,
-            crate::config::GITIGNORE_NAME,
-        ],
-    )?;
+    let mut args: Vec<&str> = vec!["add", "--all", "--"];
+    args.push(crate::config::IGNORE_NAME);
+    args.push(crate::config::GITIGNORE_NAME);
+    if !new_hash.is_empty() {
+        args.push(shadowmod::MIRROR_DIR);
+    }
+    git::run(repo, &args)?;
     let msg = format!(
         "tether scan: +{} ~{} ->{} ={} -{}",
         report.added, report.modified, report.moved, report.copied, report.deleted

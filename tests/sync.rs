@@ -27,6 +27,7 @@ fn init_repo(root: &Path, name: &str) -> (PathBuf, PathBuf) {
         path: real.to_string_lossy().into_owned(),
         label: None,
         peers: Default::default(),
+        transfer: Default::default(),
     };
     config::save(&repo, &cfg).unwrap();
     (repo, real)
@@ -125,6 +126,7 @@ fn pull_fetches_all_missing_from_peer() {
         path: real.to_string_lossy().into_owned(),
         label: None,
         peers: Default::default(),
+        transfer: Default::default(),
     };
     config::save(&repo, &cfg).unwrap();
 
@@ -156,4 +158,87 @@ fn verify_detects_same_size_content_change() {
     write(&e.real.join("a.bin"), b"bbbb");
     let bad = scan::verify(&e.repo, &e.real).unwrap();
     assert_eq!(bad.mismatches.len(), 1, "应为 1 处不一致：{bad:?}");
+}
+
+/// 克隆一个已有快照的仓库到新目录，返回 (repo, real)。
+fn clone_with_real(
+    source: &Env,
+    tag: &str,
+    real_files: &[(&str, &[u8])],
+) -> (TempDir, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join(format!("{tag}-repo"));
+    let real = tmp.path().join(format!("{tag}-real"));
+    fs::create_dir_all(&real).unwrap();
+    git::run(
+        tmp.path(),
+        &[
+            "clone",
+            &source.repo.to_string_lossy(),
+            &repo.to_string_lossy(),
+        ],
+    )
+    .unwrap();
+    config::save(
+        &repo,
+        &config::LocalConfig {
+            path: real.to_string_lossy().into_owned(),
+            label: None,
+            peers: Default::default(),
+            transfer: Default::default(),
+        },
+    )
+    .unwrap();
+    for (rel, data) in real_files {
+        write(&real.join(rel), data);
+    }
+    (tmp, repo, real)
+}
+
+#[test]
+fn get_resumes_from_existing_part() {
+    let a = setup("a");
+    write(&a.real.join("resume.bin"), b"0123456789");
+    scan::scan(&a.repo, &a.real, true).unwrap();
+
+    // 预置本地 .part 前 4 字节，pull 应从 offset=4 续传
+    let (_tmp, repo, real) = clone_with_real(&a, "c", &[("resume.bin.part", b"0123")]);
+    let r = sync::pull(&repo, &real, &local_peer(&a.repo), false).unwrap();
+
+    assert_eq!(r.fetched, 1);
+    assert_eq!(fs::read(real.join("resume.bin")).unwrap(), b"0123456789");
+    assert!(!real.join("resume.bin.part").exists(), ".part 应已改名");
+}
+
+#[test]
+fn put_resumes_from_existing_part() {
+    let a = setup("a");
+    write(&a.real.join("big.bin"), b"ABCDEFGHIJ");
+    scan::scan(&a.repo, &a.real, true).unwrap();
+
+    // 对端未扫描，但预置 .part 前 5 字节；push 应从 offset=5 续传
+    let b = setup("b");
+    write(&b.real.join("big.bin.part"), b"ABCDE");
+
+    let r = sync::push(&a.repo, &a.real, &local_peer(&b.repo), false).unwrap();
+    assert_eq!(r.put, 1);
+    assert_eq!(fs::read(b.real.join("big.bin")).unwrap(), b"ABCDEFGHIJ");
+    assert!(!b.real.join("big.bin.part").exists(), ".part 应已改名");
+}
+
+#[test]
+fn pull_uses_local_copy_for_duplicate_hash() {
+    let a = setup("a");
+    // 两个路径同内容（同 hash）
+    write(&a.real.join("p1.bin"), b"same");
+    write(&a.real.join("p2.bin"), b"same");
+    scan::scan(&a.repo, &a.real, true).unwrap();
+
+    // C：p1 已在位，p2 缺失 → p2 应从本地 p1 复制，不走网络
+    let (_tmp, repo, real) = clone_with_real(&a, "c", &[("p1.bin", b"same")]);
+    let r = sync::pull(&repo, &real, &local_peer(&a.repo), false).unwrap();
+
+    assert_eq!(r.local_copied, 1, "应本地复制：{r:?}");
+    assert_eq!(r.fetched, 0, "不应从对端取：{r:?}");
+    assert_eq!(fs::read(real.join("p2.bin")).unwrap(), b"same");
 }

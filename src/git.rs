@@ -91,6 +91,12 @@ pub fn rev_parse(repo: &Path, rev: &str) -> Result<String> {
     rev_parse_opt(repo, rev).with_context(|| format!("无法解析 rev：{rev}"))
 }
 
+/// 两个 rev 的最近共同祖先（`git merge-base`）。
+pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<String> {
+    let out = run(repo, &["merge-base", a, b])?;
+    Ok(out.trim().to_string())
+}
+
 /// 更新引用（`git update-ref <name> <to>`）。
 pub fn update_ref(repo: &Path, name: &str, to: &str) -> Result<()> {
     run(repo, &["update-ref", name, to])?;

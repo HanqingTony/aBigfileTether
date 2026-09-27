@@ -1,6 +1,6 @@
 //! 端到端测试：全部在临时目录里造真实文件夹 + 仓库，绝不触碰任何真实数据。
 
-use abigfiletether::{apply, config, git, scan};
+use abigfiletether::{apply, config, git, propagate, scan};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -27,6 +27,7 @@ fn setup() -> Env {
         path: real.to_string_lossy().into_owned(),
         label: None,
         peers: Default::default(),
+        transfer: Default::default(),
     };
     config::save(&repo, &cfg).unwrap();
     Env {
@@ -135,6 +136,39 @@ fn apply_prune_removes_extras_independent_of_base() {
     write(&e.real.join("stray.bin"), b"zzz");
     apply::apply(&e.repo, &e.real, None, true, false).unwrap();
     assert!(!e.real.join("stray.bin").exists());
+}
+
+#[test]
+fn propagate_applies_adds_and_moves_without_deletions() {
+    let e = setup();
+    write(&e.real.join("a.bin"), b"aaaa");
+    write(&e.real.join("b.bin"), b"bbbb");
+    write(&e.real.join("c.bin"), b"cccc");
+    scan::scan(&e.repo, &e.real, true).unwrap(); // master: a,b,c
+
+    // 造剪枝子分支：只有 a，且 a 被改名
+    git::run(&e.repo, &["checkout", "-q", "-b", "dev"]).unwrap();
+    git::run(
+        &e.repo,
+        &["rm", "-q", "mirrors/b.bin.tether", "mirrors/c.bin.tether"],
+    )
+    .unwrap();
+    git::run(
+        &e.repo,
+        &["mv", "mirrors/a.bin.tether", "mirrors/a2.bin.tether"],
+    )
+    .unwrap();
+    git::commit(&e.repo, "dev subset").unwrap();
+
+    git::run(&e.repo, &["checkout", "-q", "master"]).unwrap();
+
+    // propagate dev -> master：移动 a->a2，新增/删除不传播（b、c 保留）
+    let r = propagate::propagate(&e.repo, "dev", None, false).unwrap();
+    assert_eq!(r.moved, 1, "{r:?}");
+    assert!(r.skipped_deleted >= 2, "删除不传播：{r:?}");
+    assert!(e.repo.join("mirrors/a2.bin.tether").is_file());
+    assert!(e.repo.join("mirrors/b.bin.tether").is_file(), "b 不应被删");
+    assert!(e.repo.join("mirrors/c.bin.tether").is_file(), "c 不应被删");
 }
 
 #[test]

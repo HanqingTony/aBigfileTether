@@ -8,6 +8,8 @@ pub mod config;
 pub mod git;
 pub mod hash;
 pub mod model;
+pub mod propagate;
+pub mod reorg;
 pub mod scan;
 pub mod shadow;
 pub mod sync;

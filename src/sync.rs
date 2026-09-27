@@ -20,6 +20,7 @@ pub struct SyncReport {
     pub satisfied: usize,
     pub moved: usize,
     pub copied: usize,
+    pub local_copied: usize,
     pub put: usize,
     pub fetched: usize,
     pub deleted: usize,
@@ -121,12 +122,44 @@ pub fn pull(repo: &Path, real: &Path, peer: &Peer, prune: bool) -> Result<SyncRe
     let target_paths: HashSet<PathBuf> = desired.keys().cloned().collect();
     let mut report = SyncReport::default();
 
+    // 第一遍：已在位（size 命中）的路径，按 hash 记为"本地可用源"
+    let mut local_by_hash: HashMap<String, PathBuf> = HashMap::new();
     for (rel, sh) in &desired {
         let dest = real.join(rel);
         if let Ok(md) = fs::metadata(&dest)
             && md.len() == sh.size
         {
             report.satisfied += 1;
+            local_by_hash
+                .entry(sh.content_hash.clone())
+                .or_insert_with(|| rel.clone());
+        }
+    }
+
+    // 第二遍：缺失项，优先本地同 hash 复制，否则从对端取
+    for (rel, sh) in &desired {
+        let dest = real.join(rel);
+        if fs::metadata(&dest)
+            .map(|m| m.len() == sh.size)
+            .unwrap_or(false)
+        {
+            continue; // 第一遍已计入
+        }
+        if let Some(src_rel) = local_by_hash.get(&sh.content_hash).cloned() {
+            let src = real.join(&src_rel);
+            if let Some(p) = dest.parent() {
+                fs::create_dir_all(p)?;
+            }
+            fs::copy(&src, &dest)?;
+            report.local_copied += 1;
+            report.details.push(format!(
+                "本地复制 {} -> {}",
+                src_rel.display(),
+                rel.display()
+            ));
+            local_by_hash
+                .entry(sh.content_hash.clone())
+                .or_insert_with(|| rel.clone());
             continue;
         }
         match peer_by_hash.get(&sh.content_hash).and_then(|v| v.first()) {
@@ -136,6 +169,9 @@ pub fn pull(repo: &Path, real: &Path, peer: &Peer, prune: bool) -> Result<SyncRe
                 report
                     .details
                     .push(format!("get {} -> {}", q.display(), rel.display()));
+                local_by_hash
+                    .entry(sh.content_hash.clone())
+                    .or_insert_with(|| rel.clone());
             }
             None => {
                 report.missing += 1;

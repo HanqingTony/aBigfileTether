@@ -15,6 +15,20 @@ pub const IGNORE_NAME: &str = ".tetherignore";
 /// 仓库自带 .gitignore 名。
 pub const GITIGNORE_NAME: &str = ".gitignore";
 
+/// 传输后端配置（`[transfer]`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransferConfig {
+    /// 后端：`system-ssh`（默认）或 `russh`（需 `--features russh`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// russh 后端的私钥路径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// 对端上 tether 的路径（默认 `tether`）。当对端不在默认 PATH 时用绝对路径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_bin: Option<String>,
+}
+
 /// 本机专属配置；`path` 与 `peers` 随机器不同，故整个文件 gitignored。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalConfig {
@@ -26,6 +40,9 @@ pub struct LocalConfig {
     /// 对等端：名字 -> `user@host:/path`。
     #[serde(default)]
     pub peers: BTreeMap<String, String>,
+    /// 传输后端（缺省 system-ssh）。
+    #[serde(default)]
+    pub transfer: TransferConfig,
 }
 
 impl LocalConfig {
