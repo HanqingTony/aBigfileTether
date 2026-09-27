@@ -294,12 +294,19 @@ pub enum Peer {
 }
 
 impl Peer {
-    /// 解析 `user@host:/abs/repo` 为系统 ssh 对等端。
+    /// 解析 `user@host:/abs/repo` 为系统 ssh 对等端；`local:/abs/repo` 为同机本地 agent。
     /// `remote_bin` 为对端上 tether 的路径（默认调用 `tether`）。
     pub fn parse(spec: &str, remote_bin: &str) -> Result<Peer> {
-        let (host, repo) = spec
-            .split_once(':')
-            .with_context(|| format!("对等端格式应为 user@host:/repo，得到：{spec}"))?;
+        if let Some(repo) = spec.strip_prefix("local:") {
+            let bin = std::env::current_exe().context("无法获取当前可执行文件路径")?;
+            return Ok(Peer::Local {
+                bin,
+                repo: PathBuf::from(repo),
+            });
+        }
+        let (host, repo) = spec.split_once(':').with_context(|| {
+            format!("对等端格式应为 user@host:/repo 或 local:/repo，得到：{spec}")
+        })?;
         Ok(Peer::Ssh {
             host: host.to_string(),
             repo: repo.to_string(),
