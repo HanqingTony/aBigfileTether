@@ -7,6 +7,7 @@ pub mod apply;
 pub mod config;
 pub mod git;
 pub mod hash;
+pub mod inventory;
 pub mod model;
 pub mod propagate;
 pub mod reorg;

@@ -1,6 +1,6 @@
 //! tether CLI 入口。子命令见 `docs/DESIGN.md` §6。
 
-use abigfiletether::{apply, config, git, propagate, reorg, scan, sync, transport};
+use abigfiletether::{apply, config, git, inventory, propagate, reorg, scan, sync, transport};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::env;
@@ -124,6 +124,32 @@ enum Command {
         /// 执行（缺省仅预演）
         #[arg(long)]
         yes: bool,
+    },
+    /// 盘点：比较当前分支与 main 的**文件存在**差异（可限定文件夹）
+    ///
+    /// `+` 表示 main 有、当前分支没有（可 `retail`）；`-` 表示当前分支有、main 没有。
+    #[command(
+        after_help = "示例:\n  tether stocktake                       # 全部差异\n  tether stocktake comfyui/models/loras  # 只看该文件夹\n  tether stocktake --main origin/master"
+    )]
+    Stocktake {
+        /// 只显示该文件夹内的差异（可选，相对真实根）
+        #[arg(value_name = "DIR")]
+        dir: Option<String>,
+        /// main 引用，缺省 origin/master 或 master
+        #[arg(long, value_name = "REF")]
+        main: Option<String>,
+    },
+    /// 零售：把 main 中指定文件/文件夹的**影子**加入当前分支（随后 `tether pull` 取字节）
+    #[command(
+        after_help = "示例:\n  tether retail comfyui/models/loras/minimax/h3/M3_Unlocked_V2.1.safetensors\n  tether retail comfyui/models/vae/trellis\n  tether retail --main origin/master <path>"
+    )]
+    Retail {
+        /// 文件或文件夹相对路径（可多个）
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<String>,
+        /// main 引用，缺省 origin/master 或 master
+        #[arg(long, value_name = "REF")]
+        main: Option<String>,
     },
     /// 由索引生成证书，或全量校验
     ///
@@ -266,6 +292,18 @@ fn run(cli: Cli) -> Result<()> {
             print_reorg(&report);
             Ok(())
         }
+        Command::Stocktake { dir, main } => {
+            let repo = git::toplevel(&cwd()?)?;
+            let report = inventory::stocktake(&repo, main.as_deref(), dir.as_deref())?;
+            print_stocktake(&report);
+            Ok(())
+        }
+        Command::Retail { paths, main } => {
+            let repo = git::toplevel(&cwd()?)?;
+            let report = inventory::retail(&repo, main.as_deref(), &paths)?;
+            print_retail(&report);
+            Ok(())
+        }
         Command::Apply { to, prune, yes } => {
             let (repo, cfg) = load_repo()?;
             let report = apply::apply(&repo, &cfg.resolve_real(&repo), to, prune, !yes)?;
@@ -404,6 +442,50 @@ fn print_reorg(r: &reorg::ReorgReport) {
             Some(c) => println!("[INFO] 已提交 {}", &c[..c.len().min(12)]),
             None => println!("[INFO] 无变更，未提交"),
         }
+    }
+}
+
+fn print_stocktake(r: &inventory::StocktakeReport) {
+    let f = r.filter.as_deref().unwrap_or("(全部)");
+    println!(
+        "[INFO] stocktake vs {}（范围 {}）：可 retail {} 项，多出 {} 项",
+        &r.main_ref[..r.main_ref.len().min(12)],
+        f,
+        r.missing.len(),
+        r.extra.len()
+    );
+    for p in &r.missing {
+        println!("  + {p}");
+    }
+    for p in &r.extra {
+        println!("  - {p}");
+    }
+    if r.missing.is_empty() && r.extra.is_empty() {
+        println!("  （无差异）");
+    }
+}
+
+fn print_retail(r: &inventory::RetailReport) {
+    for p in &r.added {
+        println!("  取入 {p}");
+    }
+    for p in &r.skipped {
+        println!("  已有跳过 {p}");
+    }
+    for p in &r.not_found {
+        println!("  未找到 {p}");
+    }
+    println!(
+        "[INFO] retail vs {}：取入 {}  已有 {}  未找到 {}",
+        &r.main_ref[..r.main_ref.len().min(12)],
+        r.added.len(),
+        r.skipped.len(),
+        r.not_found.len()
+    );
+    if r.committed {
+        println!("[INFO] 已提交；下一步 `tether pull --from <母仓库peer>` 下载字节");
+    } else if !r.added.is_empty() {
+        println!("[INFO] 无变更，未提交");
     }
 }
 

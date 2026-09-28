@@ -1,6 +1,6 @@
 [package]
 name = "abigfiletether"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 description = "非侵入式大文件影子追踪工具（Git 只存元数据，真实文件原位不动）"
 license = "MIT"

@@ -1,6 +1,6 @@
 //! 端到端测试：全部在临时目录里造真实文件夹 + 仓库，绝不触碰任何真实数据。
 
-use abigfiletether::{apply, config, git, propagate, scan};
+use abigfiletether::{apply, config, git, inventory, propagate, scan};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -136,6 +136,58 @@ fn apply_prune_removes_extras_independent_of_base() {
     write(&e.real.join("stray.bin"), b"zzz");
     apply::apply(&e.repo, &e.real, None, true, false).unwrap();
     assert!(!e.real.join("stray.bin").exists());
+}
+
+#[test]
+fn stocktake_and_retail_against_main() {
+    let e = setup();
+    write(&e.real.join("a.bin"), b"aaaa");
+    write(&e.real.join("sub/b.bin"), b"bbbb");
+    write(&e.real.join("sub/c.bin"), b"cccc");
+    scan::scan(&e.repo, &e.real, true).unwrap(); // master: a, sub/b, sub/c
+
+    // 子分支：只保留 a
+    git::run(&e.repo, &["checkout", "-q", "-b", "dev"]).unwrap();
+    git::run(
+        &e.repo,
+        &[
+            "rm",
+            "-q",
+            "mirrors/sub/b.bin.tether",
+            "mirrors/sub/c.bin.tether",
+        ],
+    )
+    .unwrap();
+    git::commit(&e.repo, "dev subset").unwrap();
+
+    // stocktake：main 有、dev 没有 = sub/b, sub/c
+    let r = inventory::stocktake(&e.repo, None, None).unwrap();
+    assert!(r.missing.contains(&"sub/b.bin".to_string()), "{r:?}");
+    assert!(r.missing.contains(&"sub/c.bin".to_string()), "{r:?}");
+    assert!(r.extra.is_empty());
+
+    // 限定文件夹
+    let r2 = inventory::stocktake(&e.repo, None, Some("sub")).unwrap();
+    assert_eq!(r2.missing.len(), 2);
+
+    // retail 单个文件
+    let r3 = inventory::retail(&e.repo, None, &["sub/b.bin".to_string()]).unwrap();
+    assert_eq!(r3.added, vec!["sub/b.bin".to_string()]);
+    assert!(e.repo.join("mirrors/sub/b.bin.tether").is_file());
+    assert_eq!(
+        inventory::stocktake(&e.repo, None, None).unwrap().missing,
+        vec!["sub/c.bin".to_string()]
+    );
+
+    // retail 整个文件夹
+    let r5 = inventory::retail(&e.repo, None, &["sub".to_string()]).unwrap();
+    assert_eq!(r5.added, vec!["sub/c.bin".to_string()]);
+    assert!(
+        inventory::stocktake(&e.repo, None, None)
+            .unwrap()
+            .missing
+            .is_empty()
+    );
 }
 
 #[test]

@@ -225,6 +225,8 @@ tether apply [--to <ref>] [--prune] [--yes]  # 仓库 → 真实（默认 dry-ru
 tether status                            # 展示真实与影子树的差异
 tether reorg --map <file> [--real] [--yes]   # 按已知映射移动影子（可选真实），零哈希
 tether propagate --from <ref> [--onto <ref>] [--yes]  # 并回 A/M/R，丢弃 D
+tether stocktake [<dir>] [--main <ref>]  # 比较当前分支与 main 的文件存在差异
+tether retail <path>... [--main <ref>]   # 把 main 的影子加入当前分支（再 pull 取字节）
 tether cert [--verify]                   # 生成/校验证书与 root_hash
 tether pull --from <peer> [--prune]      # 从对端补齐本快照缺失的字节
 tether push --to <peer> [--prune]        # 把本快照推给对端（哈希感知，只传新字节）

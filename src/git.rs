@@ -119,10 +119,18 @@ pub struct DiffEntry {
     pub new: Option<String>,
 }
 
-/// 列出某 rev 下匹配 pathspec 的所有文件名（`git ls-tree -r --name-only`）。
+/// 列出某 rev 下匹配 pathspec 的所有文件名（`git ls-tree -r -z --name-only`）。
+/// 用 `-z` 避免 Git 对特殊字符文件名的引号转义。
 pub fn ls_tree_names(repo: &Path, rev: &str, pathspec: &str) -> Result<Vec<String>> {
-    let out = run(repo, &["ls-tree", "-r", "--name-only", rev, "--", pathspec])?;
-    Ok(out.lines().map(|s| s.to_string()).collect())
+    let out = run(
+        repo,
+        &["ls-tree", "-r", "-z", "--name-only", rev, "--", pathspec],
+    )?;
+    Ok(out
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect())
 }
 
 /// `git diff -M --name-status <from> <to> -- <pathspec>`。

@@ -44,6 +44,8 @@ Canonical spec: **`docs/DESIGN.md`** — read it before changing behavior.
 - `src/reorg.rs` — apply a known path mapping to shadows (and `--real`); **zero hashing**.
   Use this to reorganize structure instead of moving real files then `scan`.
 - `src/propagate.rs` — merge a branch's A/M/R onto another, **dropping D** (merge-safe).
+- `src/inventory.rs` — `stocktake` (main↔branch existence diff) + `retail` (copy a
+  file/folder's shadows from main into the current branch; bytes come via `pull`).
 - `src/transport.rs` — framed protocol + `tether agent` (system `ssh` is the pipe).
 - `src/sync.rs` — `push`/`pull`; hash-aware: MOVE/COPY instead of retransfer.
 - `tests/{smoke,sync}.rs` — end-to-end on temp dirs; never touch real data.
