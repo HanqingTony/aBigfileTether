@@ -1,11 +1,9 @@
 //! 重排：按**已知路径映射**移动影子（以及可选真实）文件，**不计算哈希**。
 //!
-//! 用途：批量整理目录结构时，身份已由影子记录，只需按映射改名——比"先动真实再扫描"
-//! （会为每个新路径重新哈希）快得多。
-//!
-//! 映射文件每行 `旧相对路径|新相对路径`（相对真实根）。默认只动影子仓库；`--real`
-//! 同时移动真实文件。幂等：目标已存在则跳过。
+//! 映射文件每行 `旧相对路径|新相对路径`（相对真实根）。影子总在本地仓库；真实侧由传入的
+//! `Fs`（当前分支 location，可本地/远端）执行。
 
+use crate::fs::Fs;
 use crate::git;
 use crate::scan::BASE_REF;
 use crate::shadow as shadowmod;
@@ -28,7 +26,7 @@ pub struct ReorgReport {
     pub details: Vec<String>,
 }
 
-/// 解析映射文件为 `(旧, 新)` 列表。
+/// 解析映射文件为 `(旧, 新)`。
 pub fn load_map(path: &Path) -> Result<Vec<(String, String)>> {
     let text =
         fs::read_to_string(path).with_context(|| format!("读取映射失败：{}", path.display()))?;
@@ -46,18 +44,17 @@ pub fn load_map(path: &Path) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// 执行重排。`do_real` 为真时同步移动真实文件。
+/// 执行重排。`real_fs` 为 `Some` 时同步移动真实文件。
 pub fn reorg(
     repo: &Path,
-    real: &Path,
+    real_fs: Option<&dyn Fs>,
     map_path: &Path,
-    do_real: bool,
     dry_run: bool,
 ) -> Result<ReorgReport> {
     let map = load_map(map_path)?;
     let mut report = ReorgReport {
         dry_run,
-        do_real,
+        do_real: real_fs.is_some(),
         ..Default::default()
     };
     for (old, new) in &map {
@@ -83,18 +80,14 @@ pub fn reorg(
             report.missing += 1;
         }
         // 真实
-        if do_real {
-            let ro = real.join(old);
-            let rn = real.join(new);
-            if rn.exists() {
+        if let Some(fs) = real_fs {
+            let ro = Path::new(old);
+            let rn = Path::new(new);
+            if fs.stat(rn)?.is_some() {
                 report.skipped += 1;
-            } else if ro.exists() {
+            } else if fs.stat(ro)?.is_some() {
                 if !dry_run {
-                    if let Some(p) = rn.parent() {
-                        fs::create_dir_all(p)?;
-                    }
-                    fs::rename(&ro, &rn)
-                        .with_context(|| format!("移动真实文件失败：{}", ro.display()))?;
+                    fs.mv(ro, rn)?;
                 }
                 report.real_moved += 1;
             } else {

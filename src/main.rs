@@ -1,33 +1,28 @@
-//! tether CLI 入口。子命令见 `docs/DESIGN.md` §6。
+//! tether CLI（中心模型）：一个仓库，分支携带各自 `location`；命令作用于当前分支的位置。
 
+use abigfiletether::fs as tfs;
 use abigfiletether::{apply, config, git, inventory, propagate, reorg, scan, sync, transport};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
     name = "tether",
     version,
-    about = "非侵入式大文件影子追踪工具",
-    long_about = "tether 用普通 Git 仓库追踪大文件的影子元数据：真实文件原位不动，\
-字节永不进入 Git 对象库。\n\n\
-身份 = size + blake3；路径只是位置，移动/改名靠内容哈希识别。\
-真实侧的任何改动都只在显式命令下发生（scan 只读、apply/pull/push 才动）。",
+    about = "非侵入式大文件影子追踪工具（中心仓库 + retail 模型）",
+    long_about = "一个 Git 仓库（母机）保存所有分支的影子元数据；每个分支的 tether.toml 声明该视图\n\
+对应的真实文件夹位置（local:/path 或 [user@]host:/path，相对母机视角）。命令作用于当前分支的位置，\n\
+真实字节经 hash 感知搬运（已有同 hash 零重传）。",
     arg_required_else_help = true,
     after_help = "示例:\n  \
-tether init ~/zext --repo ~/zrepo/tether-zext\n  \
+tether init local:/mnt/data/zext\n  \
 tether scan --yes\n  \
-tether status\n  \
-tether apply --yes\n  \
-tether cert --verify\n  \
-tether push --to zmain\n\n\
-配置文件（gitignored，仓库根 tether.toml）:\n  \
-path  = 本机真实文件夹；[peers] 为对等端。\n\n\
-对等端写法:\n  \
-user@host:/peer-repo（对端需在 PATH 上有 tether；推送元数据用普通 git push）。"
+tether stocktake comfyui/models/loras\n  \
+tether retail comfyui/models/vae/trellis\n  \
+tether distribute --branch zlapwsl\n  \
+tether ingest --branch zlapwsl"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,171 +31,97 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 初始化：绑定仓库与真实文件夹
-    ///
-    /// 建立（或接入）一个普通 Git 仓库，写入本机专属、被 gitignore 的 tether.toml，
-    /// 并生成 .tetherignore（排除清单 + 仓库标记）。不创建、不移动任何真实文件；
-    /// 真实路径会解析软链后记录。
-    #[command(after_help = "示例:\n  tether init ~/zext --repo ~/zrepo/tether-zext")]
+    /// 初始化：建立仓库/当前分支，写入跟踪的 tether.toml（含 location）
     Init {
-        /// 被管理的真实文件夹路径
-        #[arg(value_name = "REAL")]
-        path: PathBuf,
-        /// 仓库路径，缺省为当前目录
+        /// 位置：`local:/path` 或 `[user@]host:/path`
+        location: String,
+        /// 仓库路径，缺省当前目录
         #[arg(long, value_name = "REPO")]
         repo: Option<PathBuf>,
     },
-    /// 扫描真实文件夹 → 仓库（默认预演，--yes 落盘）
-    ///
-    /// 以「路径 + size」初筛，只有变动文件才做全量 blake3；按内容哈希识别移动/复制，
-    /// 落成 Git 变更并提交，随后写证书（真实侧顶层 TETHER.cert.toml）并推进
-    /// refs/tether/base。库存在未应用的影子变更时会拒绝扫描。
-    #[command(
-        after_help = "示例:\n  tether scan          # 预演\n  tether scan --yes    # 落盘提交"
-    )]
+    /// 扫描当前分支 location → 影子（默认预演，--yes 落盘）
     Scan {
-        /// 不询问，直接落盘提交
         #[arg(long)]
         yes: bool,
-        /// 结构化 JSON 日志
         #[arg(long)]
         log_json: bool,
     },
-    /// 应用仓库 → 真实文件夹（默认 dry-run）
-    ///
-    /// 取 refs/tether/base..target 的镜像差异落地：移动按目标影子哈希校验后改名；
-    /// 新增而真实缺失的条目留待 pull（绝不凭空造字节）；修改一律报冲突、不覆盖。
-    /// --prune 以目标快照为准删除真实侧多余文件。默认只预演。
-    #[command(
-        after_help = "示例:\n  tether apply            # 预演\n  tether apply --yes      # 执行\n  tether apply --to main --prune --yes"
-    )]
+    /// 应用当前分支影子 → location（默认 dry-run）
     Apply {
-        /// 目标提交/分支，缺省为 HEAD
-        #[arg(long, value_name = "REF")]
+        #[arg(long)]
         to: Option<String>,
-        /// 删除目标快照外的真实文件
         #[arg(long)]
         prune: bool,
-        /// 执行（缺省仅预演）
         #[arg(long)]
         yes: bool,
     },
-    /// 展示真实树与影子树的差异（不落盘）
-    ///
-    /// 等价于一次不带 --yes 的扫描，只列出 未变/修改/移动/复制/新增/删除。
+    /// 展示 location 与影子树的差异（不落盘）
     Status,
-    /// 把某分支的 新增/移动/修改 并回当前分支，**丢弃删除**
-    ///
-    /// 用于把剪枝子分支的增量安全并回 main：取 merge-base..from 的 A/M/R，不传播
-    /// D，因此在影子层不会删掉 main 的文件。随后在目标真实文件夹用 apply 落地。
-    #[command(
-        after_help = "示例:\n  tether propagate --from zlapwsl            # 预演\n  tether propagate --from zlapwsl --yes      # 落到当前分支\n  tether propagate --from zlapwsl --onto master --yes"
-    )]
-    Propagate {
-        /// 来源分支/提交
-        #[arg(long, value_name = "REF")]
-        from: String,
-        /// 目标分支/提交，缺省为 HEAD
-        #[arg(long, value_name = "REF")]
-        onto: Option<String>,
-        /// 执行（缺省仅预演）
-        #[arg(long)]
-        yes: bool,
-    },
-    /// 按已知路径映射整理影子（可选真实）文件，**不计算哈希**
-    ///
-    /// 映射文件每行 `旧相对路径|新相对路径`（相对真实根）。整理目录结构时用它，
-    /// 比"先动真实再扫描"快得多。默认只动影子仓库；--real 同时移动真实文件。
-    #[command(
-        after_help = "示例:\n  tether reorg --map plan.txt            # 预演（只影子）\n  tether reorg --map plan.txt --yes      # 落地影子\n  tether reorg --map plan.txt --real --yes  # 同时移动真实文件"
-    )]
+    /// 按已知映射整理影子（--real 同时移动 location 上的真实文件），**零哈希**
     Reorg {
-        /// 映射文件（每行 `旧|新`，相对真实根）
         #[arg(long, value_name = "FILE")]
         map: PathBuf,
-        /// 同时移动真实文件
         #[arg(long)]
         real: bool,
-        /// 执行（缺省仅预演）
         #[arg(long)]
         yes: bool,
     },
-    /// 盘点：比较当前分支与 main 的**文件存在**差异（可限定文件夹）
-    ///
-    /// `+` 表示 main 有、当前分支没有（可 `retail`）；`-` 表示当前分支有、main 没有。
-    #[command(
-        after_help = "示例:\n  tether stocktake                       # 全部差异\n  tether stocktake comfyui/models/loras  # 只看该文件夹\n  tether stocktake --main origin/master"
-    )]
+    /// 盘点：当前分支与 main 的文件存在差异（可限定文件夹）
     Stocktake {
-        /// 只显示该文件夹内的差异（可选，相对真实根）
         #[arg(value_name = "DIR")]
         dir: Option<String>,
-        /// main 引用，缺省 origin/master 或 master
         #[arg(long, value_name = "REF")]
         main: Option<String>,
     },
-    /// 零售：把 main 中指定文件/文件夹的**影子**加入当前分支（随后 `tether pull` 取字节）
-    #[command(
-        after_help = "示例:\n  tether retail comfyui/models/loras/minimax/h3/M3_Unlocked_V2.1.safetensors\n  tether retail comfyui/models/vae/trellis\n  tether retail --main origin/master <path>"
-    )]
+    /// 零售：把 main 中指定文件/文件夹的影子取入当前分支（再 distribute 取字节）
     Retail {
-        /// 文件或文件夹相对路径（可多个）
         #[arg(required = true, value_name = "PATH")]
         paths: Vec<String>,
-        /// main 引用，缺省 origin/master 或 master
         #[arg(long, value_name = "REF")]
         main: Option<String>,
     },
-    /// 由索引生成证书，或全量校验
+    /// 把某分支的 A/M/R 并回当前分支，**丢弃删除**
+    Propagate {
+        #[arg(long, value_name = "REF")]
+        from: String,
+        #[arg(long, value_name = "REF")]
+        onto: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 分发：把 <branch> 快照落到其 location（字节取自 <from> 的 location，默认 HEAD）**
     ///
-    /// 默认由当前镜像索引写证书（不重算哈希）。--verify 重算所有真实文件的 blake3，
-    /// 与索引及证书 root_hash 比对，任一处不一致则退出码 1。
-    #[command(
-        after_help = "示例:\n  tether cert            # 写证书\n  tether cert --verify   # 全量校验"
-    )]
+    /// 在母机执行；center → device。哈希感知：设备已有同 hash 只 MOVE，缺的才传。
+    Distribute {
+        /// 设备分支（其 tether.toml 给出设备位置）
+        #[arg(long, value_name = "REF")]
+        branch: String,
+        /// 字节来源分支，缺省 HEAD（母机全量）
+        #[arg(long, value_name = "REF")]
+        from: Option<String>,
+        /// 删除设备上快照外的文件
+        #[arg(long)]
+        prune: bool,
+    },
+    /// 收回：把 <branch> location 的新增/变动并入当前母机（master 影子 + 字节），删除不传播
+    ///
+    /// 在母机（master 已检出）执行；device → center。
+    Ingest {
+        #[arg(long, value_name = "REF")]
+        branch: String,
+        /// 母机引用（当前检出的分支），缺省 HEAD
+        #[arg(long, value_name = "REF")]
+        onto: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 由索引生成证书，或 `--verify` 全量校验
     Cert {
-        /// 全量重算哈希并与索引/证书比对
         #[arg(long)]
         verify: bool,
     },
-    /// 从对等端拉取本快照缺失的字节
-    ///
-    /// 对端 = tether.toml 的 [peers] 名，或 user@host:/peer-repo。按内容哈希取数，
-    /// 支持断点续传；本地别处已有同 hash 时本地复制、不下载。
-    /// --prune 删除快照外的真实文件。
-    #[command(
-        after_help = "示例:\n  tether pull --from zmain\n  tether pull --from tony@nas:/home/tony/zrepo/tether-zext --prune"
-    )]
-    Pull {
-        /// 对等端：名字或 user@host:/repo
-        #[arg(long, value_name = "PEER")]
-        from: String,
-        /// 删除快照外的真实文件
-        #[arg(long)]
-        prune: bool,
-    },
-    /// 把本快照推给对等端（哈希感知，只传新字节）
-    ///
-    /// 对端已有同 hash 的字节只做移动/复制（零重传），缺失的才传输；支持断点续传。
-    /// --prune 删除对端快照外的文件。元数据的发布请另用 git push。
-    #[command(after_help = "示例:\n  tether push --to zmain\n  tether push --to zmain --prune")]
-    Push {
-        /// 对等端：名字或 user@host:/repo
-        #[arg(long, value_name = "PEER")]
-        to: String,
-        /// 删除对等端快照外的文件
-        #[arg(long)]
-        prune: bool,
-    },
-    /// 远端 agent：被 ssh 调用，走 stdio 协议（内部使用）
-    ///
-    /// 由 `ssh <host> -- tether agent` 调起，仓库路径由协议 Hello 携带，
-    /// 通常无需手工调用；--repo 仅供本地调试。
-    Agent {
-        /// 仓库路径；缺省由协议 Hello 携带
-        #[arg(long, value_name = "REPO")]
-        repo: Option<PathBuf>,
-    },
+    /// 远端 agent：被 ssh 调用，stdout 协议（内部；无状态，以 Hello.root 为根）
+    Agent,
 }
 
 fn main() {
@@ -214,107 +135,128 @@ fn main() {
 fn cwd() -> Result<PathBuf> {
     env::current_dir().context("无法获取当前目录")
 }
-
-fn load_repo() -> Result<(PathBuf, config::LocalConfig)> {
-    let repo = git::toplevel(&cwd()?)?;
-    let cfg = config::load(&repo)?;
-    Ok((repo, cfg))
+fn toplevel() -> Result<PathBuf> {
+    git::toplevel(&cwd()?)
 }
-
-/// 解析对等端：优先查 `tether.toml` 的 `[peers]`，否则按 `user@host:/repo` 解析。
-/// 后端由 `[transfer] backend` 选择（system-ssh 默认，russh 可选）。
-fn resolve_peer(cfg: &config::LocalConfig, name: &str) -> Result<transport::Peer> {
-    let spec = cfg.peers.get(name).map(String::as_str).unwrap_or(name);
-    let remote_bin = cfg
-        .transfer
-        .remote_bin
-        .clone()
-        .unwrap_or_else(|| "tether".to_string());
-    match cfg.transfer.backend.as_deref().unwrap_or("system-ssh") {
-        "system-ssh" | "ssh" => transport::Peer::parse(spec, &remote_bin),
-        "russh" => transport::Peer::russh(spec, cfg.transfer.key.as_ref().map(PathBuf::from)),
-        other => anyhow::bail!("未知 [transfer] backend：{other}（system-ssh | russh）"),
-    }
+fn load_cfg(repo: &std::path::Path) -> Result<config::BranchConfig> {
+    config::load(repo)
+}
+fn open_fs(cfg: &config::BranchConfig) -> Result<Box<dyn tfs::Fs>> {
+    let loc = cfg.location()?;
+    tfs::open(&loc, &cfg.transfer)
+}
+fn open_rev_fs(repo: &std::path::Path, rev: &str) -> Result<Box<dyn tfs::Fs>> {
+    let cfg = config::load_at(repo, rev)?;
+    let loc = cfg.location()?;
+    tfs::open(&loc, &cfg.transfer)
 }
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init { path, repo } => {
+        Command::Init { location, repo } => {
             let repo = match repo {
                 Some(r) => r,
                 None => cwd()?,
             };
-            let real = if path.is_absolute() {
-                path
-            } else {
-                cwd()?.join(path)
-            };
-            let real = real
-                .canonicalize()
-                .context("真实文件夹不存在：请先创建后再 init（本工具不会创建真实文件）")?;
-            fs::create_dir_all(&repo)?;
+            std::fs::create_dir_all(&repo)?;
             git::init(&repo)?;
-            config::ensure_gitignore(&repo)?;
             config::ensure_ignore_file(&repo)?;
-            let cfg = config::LocalConfig {
-                path: real.to_string_lossy().into_owned(),
+            let cfg = config::BranchConfig {
+                location,
                 label: None,
-                peers: Default::default(),
                 transfer: Default::default(),
             };
             config::save(&repo, &cfg)?;
             println!("[INFO] 仓库 {}", repo.display());
-            println!("[INFO] 管理真实文件夹 {}", real.display());
+            println!("[INFO] 当前分支 location = {}", cfg.location);
             println!("[INFO] 下一步：tether scan --yes");
             Ok(())
         }
         Command::Scan { yes, log_json } => {
-            let (repo, cfg) = load_repo()?;
-            let report = scan::scan(&repo, &cfg.resolve_real(&repo), yes)?;
+            let repo = toplevel()?;
+            let cfg = load_cfg(&repo)?;
+            let f = open_fs(&cfg)?;
+            let report = scan::scan(&repo, &*f, yes)?;
             print_scan(&report, yes, log_json)?;
             Ok(())
         }
         Command::Status => {
-            let (repo, cfg) = load_repo()?;
-            let report = scan::scan(&repo, &cfg.resolve_real(&repo), false)?;
+            let repo = toplevel()?;
+            let cfg = load_cfg(&repo)?;
+            let f = open_fs(&cfg)?;
+            let report = scan::scan(&repo, &*f, false)?;
             print_scan(&report, false, false)?;
             Ok(())
         }
-        Command::Propagate { from, onto, yes } => {
-            let repo = git::toplevel(&cwd()?)?;
-            let report = propagate::propagate(&repo, &from, onto, !yes)?;
-            print_propagate(&report);
-            Ok(())
-        }
-        Command::Reorg { map, real, yes } => {
-            let (repo, cfg) = load_repo()?;
-            let report = reorg::reorg(&repo, &cfg.resolve_real(&repo), &map, real, !yes)?;
-            print_reorg(&report);
-            Ok(())
-        }
-        Command::Stocktake { dir, main } => {
-            let repo = git::toplevel(&cwd()?)?;
-            let report = inventory::stocktake(&repo, main.as_deref(), dir.as_deref())?;
-            print_stocktake(&report);
-            Ok(())
-        }
-        Command::Retail { paths, main } => {
-            let repo = git::toplevel(&cwd()?)?;
-            let report = inventory::retail(&repo, main.as_deref(), &paths)?;
-            print_retail(&report);
-            Ok(())
-        }
         Command::Apply { to, prune, yes } => {
-            let (repo, cfg) = load_repo()?;
-            let report = apply::apply(&repo, &cfg.resolve_real(&repo), to, prune, !yes)?;
+            let repo = toplevel()?;
+            let cfg = load_cfg(&repo)?;
+            let f = open_fs(&cfg)?;
+            let report = apply::apply(&repo, &*f, to, prune, !yes)?;
             print_apply(&report);
             Ok(())
         }
+        Command::Reorg { map, real, yes } => {
+            let repo = toplevel()?;
+            if real {
+                let cfg = load_cfg(&repo)?;
+                let f = open_fs(&cfg)?;
+                let report = reorg::reorg(&repo, Some(&*f), &map, !yes)?;
+                print_reorg(&report);
+            } else {
+                let report = reorg::reorg(&repo, None, &map, !yes)?;
+                print_reorg(&report);
+            }
+            Ok(())
+        }
+        Command::Stocktake { dir, main } => {
+            let repo = toplevel()?;
+            print_stocktake(&inventory::stocktake(
+                &repo,
+                main.as_deref(),
+                dir.as_deref(),
+            )?);
+            Ok(())
+        }
+        Command::Retail { paths, main } => {
+            let repo = toplevel()?;
+            print_retail(&inventory::retail(&repo, main.as_deref(), &paths)?);
+            Ok(())
+        }
+        Command::Propagate { from, onto, yes } => {
+            let repo = toplevel()?;
+            print_propagate(&propagate::propagate(&repo, &from, onto, !yes)?);
+            Ok(())
+        }
+        Command::Distribute {
+            branch,
+            from,
+            prune,
+        } => {
+            let repo = toplevel()?;
+            let src_rev = from.unwrap_or_else(|| "HEAD".to_string());
+            let master_fs = open_rev_fs(&repo, &src_rev)?;
+            let dev_fs = open_rev_fs(&repo, &branch)?;
+            let idx = sync::branch_index(&repo, &branch)?;
+            let report = sync::distribute(&repo, &idx, &*dev_fs, &*master_fs, prune)?;
+            print_sync("distribute", &report);
+            Ok(())
+        }
+        Command::Ingest { branch, onto, yes } => {
+            let repo = toplevel()?;
+            let dev_fs = open_rev_fs(&repo, &branch)?;
+            let onto_rev = onto.unwrap_or_else(|| "HEAD".to_string());
+            let master_fs = open_rev_fs(&repo, &onto_rev)?;
+            let report = sync::ingest(&repo, &*dev_fs, &*master_fs, yes)?;
+            print_sync("ingest", &report);
+            Ok(())
+        }
         Command::Cert { verify } => {
-            let (repo, cfg) = load_repo()?;
-            let real = cfg.resolve_real(&repo);
+            let repo = toplevel()?;
+            let cfg = load_cfg(&repo)?;
+            let f = open_fs(&cfg)?;
             if verify {
-                let r = scan::verify(&repo, &real)?;
+                let r = scan::verify(&repo, &*f)?;
                 println!(
                     "[INFO] 校验 {} 项：一致 {}，不一致 {}",
                     r.checked,
@@ -329,26 +271,12 @@ fn run(cli: Cli) -> Result<()> {
                     anyhow::bail!("校验未通过");
                 }
             } else {
-                let n = scan::write_cert_from_index(&repo, &real)?;
-                println!("[INFO] 已写证书 {}（{n} 项）", real.display());
+                let n = scan::write_cert_from_index(&repo, &*f)?;
+                println!("[INFO] 已写证书（{n} 项）");
             }
             Ok(())
         }
-        Command::Pull { from, prune } => {
-            let (repo, cfg) = load_repo()?;
-            let peer = resolve_peer(&cfg, &from)?;
-            let report = sync::pull(&repo, &cfg.resolve_real(&repo), &peer, prune)?;
-            print_sync("pull", &report);
-            Ok(())
-        }
-        Command::Push { to, prune } => {
-            let (repo, cfg) = load_repo()?;
-            let peer = resolve_peer(&cfg, &to)?;
-            let report = sync::push(&repo, &cfg.resolve_real(&repo), &peer, prune)?;
-            print_sync("push", &report);
-            Ok(())
-        }
-        Command::Agent { repo } => transport::run_agent(repo),
+        Command::Agent => transport::run_agent(),
     }
 }
 
@@ -386,7 +314,7 @@ fn print_apply(r: &apply::ApplyReport) {
         println!("   {d}");
     }
     println!(
-        "[INFO] 移动 {}  删除 {}  已在位 {}  冲突 {}  待pull {}  保留(未开prune) {}",
+        "[INFO] 移动 {}  删除 {}  已在位 {}  冲突 {}  待distribute {}  保留(未开prune) {}",
         r.renamed, r.removed, r.satisfied, r.conflicts, r.need_pull, r.prune_skipped
     );
     if r.dry_run {
@@ -394,32 +322,7 @@ fn print_apply(r: &apply::ApplyReport) {
     } else if r.applied {
         println!("[INFO] 已应用，base 更新到 {}", r.target);
     } else {
-        println!("[INFO] 未完全应用（存在冲突或待 pull），base 未更新");
-    }
-}
-
-fn print_propagate(r: &propagate::PropagateReport) {
-    for d in &r.details {
-        println!("   {d}");
-    }
-    println!(
-        "[INFO] propagate {} -> {}: 新增 {}  更新 {}  移动 {}  丢弃删除 {}  已存在跳过 {}  冲突 {}",
-        r.from,
-        r.onto,
-        r.added,
-        r.updated,
-        r.moved,
-        r.skipped_deleted,
-        r.skipped_existing,
-        r.conflicts
-    );
-    if r.dry_run {
-        println!("[INFO] 预演（未落盘）；加 --yes 执行");
-    } else if r.committed {
-        match &r.commit {
-            Some(c) => println!("[INFO] 已提交 {}", &c[..c.len().min(12)]),
-            None => println!("[INFO] 无变更，未提交"),
-        }
+        println!("[INFO] 未完全应用（存在冲突或待 distribute），base 未更新");
     }
 }
 
@@ -483,9 +386,32 @@ fn print_retail(r: &inventory::RetailReport) {
         r.not_found.len()
     );
     if r.committed {
-        println!("[INFO] 已提交；下一步 `tether pull --from <母仓库peer>` 下载字节");
-    } else if !r.added.is_empty() {
-        println!("[INFO] 无变更，未提交");
+        println!("[INFO] 已提交；下一步 `tether distribute --branch <本分支>` 下载字节");
+    }
+}
+
+fn print_propagate(r: &propagate::PropagateReport) {
+    for d in &r.details {
+        println!("   {d}");
+    }
+    println!(
+        "[INFO] propagate {} -> {}: 新增 {}  更新 {}  移动 {}  丢弃删除 {}  已存在跳过 {}  冲突 {}",
+        r.from,
+        r.onto,
+        r.added,
+        r.updated,
+        r.moved,
+        r.skipped_deleted,
+        r.skipped_existing,
+        r.conflicts
+    );
+    if r.dry_run {
+        println!("[INFO] 预演（未落盘）；加 --yes 执行");
+    } else if r.committed {
+        match &r.commit {
+            Some(c) => println!("[INFO] 已提交 {}", &c[..c.len().min(12)]),
+            None => println!("[INFO] 无变更，未提交"),
+        }
     }
 }
 
@@ -494,7 +420,7 @@ fn print_sync(op: &str, r: &sync::SyncReport) {
         println!("   {d}");
     }
     println!(
-        "[INFO] {op}: 已在位 {}  移动 {}  复制 {}  本地复制 {}  传输 {}  拉取 {}  删除 {}  缺失 {}",
-        r.satisfied, r.moved, r.copied, r.local_copied, r.put, r.fetched, r.deleted, r.missing
+        "[INFO] {op}: 已在位 {}  移动 {}  复制 {}  传输 {}  新增 {}  修改 {}  删除 {}  缺失 {}",
+        r.satisfied, r.moved, r.copied, r.put, r.added, r.modified, r.deleted, r.missing
     );
 }
