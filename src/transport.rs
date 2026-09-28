@@ -362,37 +362,43 @@ impl Agent {
         }
     }
 
-    /// 流式取回文件写入 `writer`，返回 (size, hash)。
-    pub fn read_to(&mut self, path: &[u8], writer: &mut dyn Write) -> Result<(u64, String)> {
+    /// 从 `offset` 起流式取回文件写入 `writer`，返回完整 (size, hash)。
+    pub fn read_to(
+        &mut self,
+        path: &[u8],
+        writer: &mut dyn Write,
+        offset: u64,
+    ) -> Result<(u64, String)> {
         self.send(&Request::Get {
             path: path.to_vec(),
-            offset: 0,
+            offset,
         })?;
         let (size, hash) = match self.response()? {
             Response::Started { size, hash } => (size, hash),
             Response::Error { message } => bail!("对端错误：{message}"),
             other => bail!("非预期响应：{other:?}"),
         };
-        let mut limited = self.conn.reader().take(size);
+        let mut limited = self.conn.reader().take(size - offset);
         io::copy(&mut limited, writer).context("接收字节失败")?;
         Ok((size, hash))
     }
 
-    /// 从 `reader` 流式写入远端文件，agent 校验哈希。
+    /// 从 `offset` 起把 `reader` 流式写入远端文件（续传），agent 校验完整哈希。
     pub fn write_from(
         &mut self,
         path: &[u8],
         reader: &mut dyn Read,
+        offset: u64,
         size: u64,
         hash: &str,
     ) -> Result<()> {
         self.send(&Request::Put {
             path: path.to_vec(),
-            offset: 0,
+            offset,
             size,
             hash: hash.to_string(),
         })?;
-        io::copy(&mut reader.take(size), self.conn.writer()).context("发送字节失败")?;
+        io::copy(&mut reader.take(size - offset), self.conn.writer()).context("发送字节失败")?;
         self.conn.writer().flush()?;
         match self.response()? {
             Response::PutDone { .. } => Ok(()),

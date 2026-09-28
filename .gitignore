@@ -1,3 +1,6 @@
 /target
-# 本机专属配置（真实文件夹路径 / 对等端），绝不入库
+# agent 二进制放入仓库工作区（gitignore）
+/.tether/
+/tether
+# 本机专属文件（数据仓库里 tether.toml 是跟踪文件；此处仅防误入库）
 tether.toml

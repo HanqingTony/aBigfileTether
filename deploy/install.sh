@@ -1,16 +1,16 @@
 #!/bin/bash
-### install.sh - 构建并部署 tether 到 PATH（本机或远端，幂等）
+### install.sh - 构建并部署 tether（默认放进仓库工作区 .tether/，gitignored）
 ### 用法:
-###   bash deploy/install.sh                                   # 装到本机 /usr/local/bin（需 sudo）
-###   bash deploy/install.sh --dest ~/.local/bin               # 装到无 sudo 的目录
-###   bash deploy/install.sh --host tony@192.168.0.101 --dest /home/tony/.local/bin
+###   bash deploy/install.sh                              # 装到 <repo>/.tether/tether
+###   bash deploy/install.sh --dest /usr/local/bin        # 装到系统 PATH
+###   bash deploy/install.sh --host tony@192.168.0.101 --dest /home/tony/.tether
 ### 选项: --host <ssh目标> --dest <目录> --features <cargo特性> --no-build
-### 验证: tether --version    /    ssh <host> -- <dest>/tether --version
+### 验证: <dest>/tether --version
 set -euo pipefail
 
 REPO_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 HOST=""
-DEST="/usr/local/bin"
+DEST="$REPO_DIR/.tether"
 FEATURES=""
 BUILD=1
 

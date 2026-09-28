@@ -112,3 +112,20 @@ fn ingest_recognizes_move_on_device() {
     assert!(!e.real.join("a.bin").exists());
     assert!(e.repo.join("mirrors/a2.bin.tether").is_file());
 }
+
+#[test]
+fn distribute_resumes_from_existing_part() {
+    let e = setup();
+    write(&e.real.join("big.bin"), b"0123456789");
+    scan::scan(&e.repo, &lfs(&e), true).unwrap();
+
+    let dr = dev_real(&e, "dev-real");
+    // 预置 .part 前 4 字节；distribute 应从 offset=4 续传
+    write(&dr.join("big.bin.part"), b"0123");
+
+    let idx = abigfiletether::shadow::load_index(&e.repo).unwrap();
+    let r = sync::distribute(&e.repo, &idx, &LocalFs::new(&dr), &lfs(&e), false).unwrap();
+    assert_eq!(r.put, 1, "{r:?}");
+    assert_eq!(fs::read(dr.join("big.bin")).unwrap(), b"0123456789");
+    assert!(!dr.join("big.bin.part").exists(), ".part 应已改名");
+}

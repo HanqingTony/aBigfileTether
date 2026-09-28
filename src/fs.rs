@@ -6,7 +6,7 @@
 use crate::config::{Location, TransferConfig};
 use crate::transport::{self, Agent};
 use anyhow::{Context, Result, bail};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -27,8 +27,16 @@ pub trait Fs: Send + Sync {
     fn walk(&self) -> Result<Vec<FileEntry>>;
     fn hash(&self, rel: &Path) -> Result<String>;
     fn stat(&self, rel: &Path) -> Result<Option<u64>>;
-    fn read_to(&self, rel: &Path, w: &mut dyn Write) -> Result<(u64, String)>;
-    fn write_from(&self, rel: &Path, r: &mut dyn Read, size: u64, hash: &str) -> Result<()>;
+    fn read_to(&self, rel: &Path, w: &mut dyn Write, offset: u64) -> Result<(u64, String)>;
+    fn write_from(
+        &self,
+        rel: &Path,
+        r: &mut dyn Read,
+        offset: u64,
+        size: u64,
+        hash: &str,
+    ) -> Result<()>;
+    fn part_size(&self, rel: &Path) -> Result<u64>;
     fn mv(&self, from: &Path, to: &Path) -> Result<()>;
     fn cp(&self, from: &Path, to: &Path) -> Result<()>;
     fn rm(&self, rel: &Path) -> Result<()>;
@@ -119,12 +127,24 @@ impl Fs for LocalFs {
         }
     }
 
-    fn read_to(&self, rel: &Path, w: &mut dyn Write) -> Result<(u64, String)> {
+    fn read_to(&self, rel: &Path, w: &mut dyn Write, offset: u64) -> Result<(u64, String)> {
         let p = self.full(rel);
         let mut f = File::open(&p).with_context(|| format!("打开 {} 失败", p.display()))?;
+        let size = f.metadata()?.len();
         let mut hasher = blake3::Hasher::new();
         let mut buf = vec![0u8; 1 << 20];
-        let mut total = 0u64;
+        // 先喂已存在前缀（保证返回完整哈希）
+        let mut left = offset;
+        while left > 0 {
+            let want = left.min(buf.len() as u64) as usize;
+            let n = f.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            left -= n as u64;
+        }
+        // 再流式剩余
         loop {
             let n = f.read(&mut buf)?;
             if n == 0 {
@@ -132,22 +152,47 @@ impl Fs for LocalFs {
             }
             hasher.update(&buf[..n]);
             w.write_all(&buf[..n])?;
-            total += n as u64;
         }
-        Ok((total, format!("blake3:{}", hasher.finalize().to_hex())))
+        Ok((size, format!("blake3:{}", hasher.finalize().to_hex())))
     }
 
-    fn write_from(&self, rel: &Path, r: &mut dyn Read, size: u64, hash: &str) -> Result<()> {
+    fn write_from(
+        &self,
+        rel: &Path,
+        r: &mut dyn Read,
+        offset: u64,
+        size: u64,
+        hash: &str,
+    ) -> Result<()> {
         let dst = self.full(rel);
         if let Some(p) = dst.parent() {
             fs::create_dir_all(p)?;
         }
         let tmp = part_path(&dst);
-        let file = File::create(&tmp)?;
         let mut hasher = blake3::Hasher::new();
+        let mut writer: Box<dyn Write> = if offset == 0 {
+            Box::new(BufWriter::new(File::create(&tmp)?))
+        } else {
+            let cur = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+            if cur != offset {
+                bail!("断点不一致：.part {cur} != {offset}");
+            }
+            let mut pf = File::open(&tmp)?;
+            let mut b = vec![0u8; 1 << 20];
+            let mut left = offset;
+            while left > 0 {
+                let want = left.min(b.len() as u64) as usize;
+                let n = pf.read(&mut b[..want])?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&b[..n]);
+                left -= n as u64;
+            }
+            Box::new(BufWriter::new(OpenOptions::new().append(true).open(&tmp)?))
+        };
         {
-            let mut writer = BufWriter::new(file);
-            let mut limited = r.take(size);
+            let mut limited = r.take(size - offset);
             let mut buf = vec![0u8; 1 << 20];
             loop {
                 let n = limited.read(&mut buf)?;
@@ -159,6 +204,7 @@ impl Fs for LocalFs {
             }
             writer.flush()?;
         }
+        drop(writer);
         let got = format!("blake3:{}", hasher.finalize().to_hex());
         if got != hash {
             fs::remove_file(&tmp).ok();
@@ -169,6 +215,12 @@ impl Fs for LocalFs {
         }
         fs::rename(&tmp, &dst)?;
         Ok(())
+    }
+
+    fn part_size(&self, rel: &Path) -> Result<u64> {
+        Ok(fs::metadata(part_path(&self.full(rel)))
+            .map(|m| m.len())
+            .unwrap_or(0))
     }
 
     fn mv(&self, from: &Path, to: &Path) -> Result<()> {
@@ -239,18 +291,34 @@ impl Fs for RemoteFs {
         Ok(if exists { Some(size) } else { None })
     }
 
-    fn read_to(&self, rel: &Path, w: &mut dyn Write) -> Result<(u64, String)> {
+    fn read_to(&self, rel: &Path, w: &mut dyn Write, offset: u64) -> Result<(u64, String)> {
         self.agent
             .lock()
             .unwrap()
-            .read_to(&transport::path_to_bytes(rel), w)
+            .read_to(&transport::path_to_bytes(rel), w, offset)
     }
 
-    fn write_from(&self, rel: &Path, r: &mut dyn Read, size: u64, hash: &str) -> Result<()> {
+    fn write_from(
+        &self,
+        rel: &Path,
+        r: &mut dyn Read,
+        offset: u64,
+        size: u64,
+        hash: &str,
+    ) -> Result<()> {
         self.agent
             .lock()
             .unwrap()
-            .write_from(&transport::path_to_bytes(rel), r, size, hash)
+            .write_from(&transport::path_to_bytes(rel), r, offset, size, hash)
+    }
+
+    fn part_size(&self, rel: &Path) -> Result<u64> {
+        let (_, _, part) = self
+            .agent
+            .lock()
+            .unwrap()
+            .stat(&transport::path_to_bytes(rel))?;
+        Ok(part)
     }
 
     fn mv(&self, from: &Path, to: &Path) -> Result<()> {
@@ -325,6 +393,11 @@ pub fn copy_between(
     size: u64,
     hash: &str,
 ) -> Result<()> {
+    // 断点续传：从目标已存在的 .part 继续（若是陈旧的大于目标的残留则从 0 重来）
+    let mut offset = dst.part_size(drel)?;
+    if offset > size {
+        offset = 0;
+    }
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(32);
     let mut writer = ChanWriter(tx);
     let mut reader = ChanReader {
@@ -333,8 +406,8 @@ pub fn copy_between(
         pos: 0,
     };
     std::thread::scope(|s| -> Result<()> {
-        let h = s.spawn(move || src.read_to(srel, &mut writer));
-        let r = dst.write_from(drel, &mut reader, size, hash);
+        let h = s.spawn(move || src.read_to(srel, &mut writer, offset));
+        let r = dst.write_from(drel, &mut reader, offset, size, hash);
         let src_res = h.join().map_err(|_| anyhow::anyhow!("搬运线程 panic"))?;
         r?;
         src_res?;

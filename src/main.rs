@@ -89,7 +89,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// 分发：把 <branch> 快照落到其 location（字节取自 <from> 的 location，默认 HEAD）**
+    /// 分发：把 <branch> 快照落到其 location（字节取自 <from> 的 location，默认 HEAD）
     ///
     /// 在母机执行；center → device。哈希感知：设备已有同 hash 只 MOVE，缺的才传。
     Distribute {

@@ -285,6 +285,7 @@ fn write_cert(fs: &dyn Fs, content: &BTreeMap<PathBuf, (u64, String)>) -> Result
     fs.write_from(
         Path::new(shadowmod::CERT_NAME),
         &mut rd,
+        0,
         bytes.len() as u64,
         &digest,
     )?;
@@ -347,7 +348,7 @@ pub fn verify(repo: &Path, fs: &dyn Fs) -> Result<VerifyReport> {
     let root = hash::blake3_bytes(root_input.as_bytes());
     if fs.stat(Path::new(shadowmod::CERT_NAME))?.is_some() {
         let mut buf = Vec::new();
-        fs.read_to(Path::new(shadowmod::CERT_NAME), &mut buf)?;
+        fs.read_to(Path::new(shadowmod::CERT_NAME), &mut buf, 0)?;
         let cert: Certificate =
             toml::from_str(&String::from_utf8_lossy(&buf)).context("解析证书失败")?;
         report.cert_ok = cert.root_hash == root;
