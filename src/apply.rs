@@ -1,21 +1,15 @@
-//! 应用：仓库 → 真实文件夹（默认 dry-run，`--prune` 才删）。
+//! 应用：仓库 → 真实文件夹（由 `Fs` 抽象）。默认 dry-run；`--prune` 才删。
 //!
-//! 见 `docs/DESIGN.md` §5.2。以 `refs/tether/base` 为基线，取
-//! `base..target` 在镜像树上的差异，映射为真实文件夹操作。
-//!
-//! 原则：**绝不凭空造字节、绝不覆盖内容**。新增而真实缺失的条目留待 `pull`；
-//! 移动/已在位在执行时按目标影子的 `content_hash` 做**全量校验**。
+//! 移动/已在位在执行时按目标影子的 `content_hash` 全量校验；新增而真实缺失的留待 distribute。
 
+use crate::fs::Fs;
 use crate::git;
-use crate::hash;
 use crate::model::Shadow;
-use crate::scan::BASE_REF;
 use crate::shadow as shadowmod;
 use crate::walk;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// 一次应用的结果摘要。
@@ -33,16 +27,17 @@ pub struct ApplyReport {
     pub details: Vec<String>,
 }
 
-/// 把仓库某目标状态落到真实文件夹。
+/// 把仓库某目标状态落到 `fs`（真实文件夹）。
 pub fn apply(
     repo: &Path,
-    real: &Path,
+    fs: &dyn Fs,
     to: Option<String>,
     prune: bool,
     dry_run: bool,
 ) -> Result<ApplyReport> {
-    let base = git::rev_parse_opt(repo, BASE_REF)
-        .context("缺少 refs/tether/base：请先 `tether scan` 建立基线")?;
+    let bref = crate::scan::base_ref(repo)?;
+    let base =
+        git::rev_parse_opt(repo, &bref).context("缺少本分支 base：请先 `tether scan` 建立基线")?;
     let target_ref = to.unwrap_or_else(|| "HEAD".to_string());
     let target = git::rev_parse(repo, &target_ref)?;
 
@@ -65,20 +60,18 @@ pub fn apply(
                 ) else {
                     continue;
                 };
-                let src = real.join(&old_rel);
-                let dst = real.join(&new_rel);
-                if !src.exists() {
+                if fs.stat(&old_rel)?.is_none() {
                     report.conflicts += 1;
                     report
                         .details
-                        .push(format!("冲突：待移动源不存在 {}", src.display()));
+                        .push(format!("冲突：待移动源不存在 {}", old_rel.display()));
                     continue;
                 }
-                if dst.exists() {
+                if fs.stat(&new_rel)?.is_some() {
                     report.conflicts += 1;
                     report
                         .details
-                        .push(format!("冲突：目标已存在 {}", dst.display()));
+                        .push(format!("冲突：目标已存在 {}", new_rel.display()));
                     continue;
                 }
                 if dry_run {
@@ -89,7 +82,7 @@ pub fn apply(
                     ));
                 } else {
                     let exp = target_shadow(repo, &target, &new_rel)?;
-                    let actual = hash::blake3_file(&src)?;
+                    let actual = fs.hash(&old_rel)?;
                     if actual != exp.content_hash {
                         report.conflicts += 1;
                         report.details.push(format!(
@@ -98,12 +91,7 @@ pub fn apply(
                         ));
                         continue;
                     }
-                    if let Some(p) = dst.parent() {
-                        fs::create_dir_all(p)?;
-                    }
-                    fs::rename(&src, &dst).with_context(|| {
-                        format!("移动失败：{} -> {}", src.display(), dst.display())
-                    })?;
+                    fs.mv(&old_rel, &new_rel)?;
                 }
                 report.renamed += 1;
             }
@@ -112,20 +100,16 @@ pub fn apply(
                 let Some(new_rel) = shadowmod::rel_from_shadow_str(&new) else {
                     continue;
                 };
-                let dst = real.join(&new_rel);
-                if !dst.exists() {
+                let Some(size) = fs.stat(&new_rel)? else {
                     report.need_pull += 1;
                     report.details.push(format!(
-                        "需 pull：{} 真实缺失（apply 不造字节）",
+                        "需 distribute：{} 真实缺失（apply 不造字节）",
                         new_rel.display()
                     ));
                     continue;
-                }
+                };
                 let exp = target_shadow(repo, &target, &new_rel)?;
-                let size_ok = fs::metadata(&dst)
-                    .map(|m| m.len() == exp.size)
-                    .unwrap_or(false);
-                if !size_ok {
+                if size != exp.size {
                     report.conflicts += 1;
                     report.details.push(format!(
                         "冲突：{} 已存在但大小与影子不符",
@@ -137,7 +121,7 @@ pub fn apply(
                         .details
                         .push(format!("已在位：{}（执行时按哈希校验）", new_rel.display()));
                 } else {
-                    let actual = hash::blake3_file(&dst)?;
+                    let actual = fs.hash(&new_rel)?;
                     if actual == exp.content_hash {
                         report.satisfied += 1;
                         report
@@ -165,7 +149,6 @@ pub fn apply(
                     continue;
                 };
                 if prune {
-                    // 由下方以"目标快照"为准的 extras 扫描统一删除
                     report.details.push(format!("删除 {}", old_rel.display()));
                 } else {
                     report.prune_skipped += 1;
@@ -175,17 +158,18 @@ pub fn apply(
         }
     }
 
-    // ---------- prune：以目标快照为准，清掉真实侧多余文件（幂等，与 base 无关） ----------
+    // prune：以目标快照为准，清掉落 location 上的多余文件（幂等，与 base 无关）
     if prune {
         let names = git::ls_tree_names(repo, &target, shadowmod::MIRROR_DIR)?;
         let target_set: HashSet<PathBuf> = names
             .iter()
             .filter_map(|s| shadowmod::rel_from_shadow_str(s))
             .collect();
-        for f in walk::collect(repo, real)? {
+        let raw = fs.walk()?;
+        for f in walk::filter(repo, fs.root(), raw)? {
             if !target_set.contains(&f.rel) {
                 if !dry_run {
-                    fs::remove_file(real.join(&f.rel)).ok();
+                    fs.rm(&f.rel)?;
                 }
                 report.removed += 1;
                 report
@@ -196,13 +180,12 @@ pub fn apply(
     }
 
     if !dry_run && report.conflicts == 0 && report.need_pull == 0 {
-        git::update_ref(repo, BASE_REF, &target)?;
+        git::update_ref(repo, &bref, &target)?;
         report.applied = true;
     }
     Ok(report)
 }
 
-/// 读取 target 下某真实相对路径对应的影子。
 fn target_shadow(repo: &Path, target: &str, rel: &Path) -> Result<Shadow> {
     let git_path = format!(
         "{}/{}{}",

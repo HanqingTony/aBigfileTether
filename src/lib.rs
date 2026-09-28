@@ -5,6 +5,7 @@
 
 pub mod apply;
 pub mod config;
+pub mod fs;
 pub mod git;
 pub mod hash;
 pub mod inventory;

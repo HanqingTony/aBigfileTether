@@ -21,10 +21,15 @@ Canonical spec: **`docs/DESIGN.md`** — read it before changing behavior.
   filter is **path + size**; only files whose path or size changed get hashed.
 - **Cross-platform incl. Windows.** No inode, no Unix permission bits, no
   POSIX-only path assumptions. Paths are OS-native byte strings.
-- **One repo ↔ one managed folder.** No multi-root. The machine-specific path
-  lives in `tether.toml`, which MUST be gitignored.
+- **Central model.** ONE Git repo (on the mothership host) holds every branch's
+  shadows. Each branch's **tracked** `tether.toml` carries its `location`
+  (`local:/path` or `[user@]host:/path`, from the mothership's view); `git checkout`
+  switches the location. The program lives once on the mothership; the remote
+  `agent` is the same binary (stateless, rooted at `Hello.root`), placed inside the
+  repo tree and **gitignored**.
 - **`apply` never fabricates or overwrites real bytes**; it deletes nothing unless
-  `--prune`. Real byte transfer is only `push`/`pull`.
+  `--prune`. Byte transfer is only `distribute` (mothership→device) / `ingest`
+  (device→mothership), hash-aware and resumable.
 
 ## Commands
 
@@ -38,20 +43,21 @@ Canonical spec: **`docs/DESIGN.md`** — read it before changing behavior.
 
 ## Layout
 
-- `src/git.rs` — all Git access shells out to system `git` (no libgit2, no hooks).
-- `src/scan.rs` — real→repo; `refs/tether/base` tracks the commit real matches.
-- `src/apply.rs` — repo→real; `--prune` deletes extras vs the target snapshot.
+- `src/config.rs` — per-branch `tether.toml` (tracked) with `location`; `.tetherignore`.
+- `src/fs.rs` — `Fs` abstraction: `LocalFs` / `RemoteFs` (over the agent).
+- `src/scan.rs` — location→repo; `refs/tether/base` tracks the commit real matches.
+- `src/apply.rs` — repo→location; `--prune` deletes extras vs the target snapshot.
 - `src/reorg.rs` — apply a known path mapping to shadows (and `--real`); **zero hashing**.
   Use this to reorganize structure instead of moving real files then `scan`.
 - `src/propagate.rs` — merge a branch's A/M/R onto another, **dropping D** (merge-safe).
 - `src/inventory.rs` — `stocktake` (main↔branch existence diff) + `retail` (copy a
-  file/folder's shadows from main into the current branch; bytes come via `pull`).
-- `src/transport.rs` — framed protocol + `tether agent` (system `ssh` is the pipe).
-- `src/sync.rs` — `push`/`pull`; hash-aware: MOVE/COPY instead of retransfer.
-- `tests/{smoke,sync}.rs` — end-to-end on temp dirs; never touch real data.
+  file/folder's shadows from main into the current branch; bytes come via `distribute`).
+- `src/transport.rs` — framed protocol + stateless `tether agent` (system `ssh` pipe).
+- `src/sync.rs` — `distribute`/`ingest`; hash-aware MOVE/COPY, resumable.
+- `tests/{smoke,sync}.rs` — end-to-end on temp dirs via `LocalFs`; never touch real data.
 
-Tests spawn the built binary as a local `tether agent`, so they exercise the real
-wire protocol without SSH.
+Tests use `LocalFs` directly (no subprocess/SSH); the agent wire protocol is not
+covered by the test suite — validate it manually against a real host.
 
 ## Reference
 
@@ -66,7 +72,8 @@ wire protocol without SSH.
 
 - Code comments in **Chinese** (matches the zscript house style); keep them minimal.
 - Do not commit unless explicitly asked.
-- Never commit secrets or machine-specific paths (`tether.toml` is gitignored).
+- Never commit secrets. The agent binary lives in the repo tree (`.tether/`) and is
+  **gitignored**; `tether.toml` is **tracked** (branch config) and MUST be committed.
 
 ## Git workflow
 
