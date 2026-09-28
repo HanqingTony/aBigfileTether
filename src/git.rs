@@ -91,6 +91,16 @@ pub fn rev_parse(repo: &Path, rev: &str) -> Result<String> {
     rev_parse_opt(repo, rev).with_context(|| format!("无法解析 rev：{rev}"))
 }
 
+/// 当前分支名（未出生分支也能取到；detached 时回退短 sha）。
+pub fn current_branch(repo: &Path) -> Result<String> {
+    if let Some(s) = try_run(repo, &["symbolic-ref", "--short", "HEAD"]) {
+        return Ok(s.trim().to_string());
+    }
+    Ok(try_run(repo, &["rev-parse", "--short", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "HEAD".to_string()))
+}
+
 /// 两个 rev 的最近共同祖先（`git merge-base`）。
 pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<String> {
     let out = run(repo, &["merge-base", a, b])?;

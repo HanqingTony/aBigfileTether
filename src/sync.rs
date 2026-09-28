@@ -232,7 +232,7 @@ pub fn ingest(
             ),
         )?;
         if let Some(head) = crate::git::rev_parse_opt(repo, "HEAD") {
-            crate::git::update_ref(repo, crate::scan::BASE_REF, &head)?;
+            crate::git::update_ref(repo, &crate::scan::base_ref(repo)?, &head)?;
         }
     }
     Ok(report)

@@ -67,7 +67,7 @@ fn init_scan_creates_shadows_cert_and_base() {
     assert!(e.repo.join("mirrors/wéird name [x].bin.tether").is_file());
     assert!(e.real.join("TETHER.cert.toml").is_file());
 
-    let base = git::rev_parse(&e.repo, scan::BASE_REF).unwrap();
+    let base = git::rev_parse(&e.repo, &scan::base_ref(&e.repo).unwrap()).unwrap();
     let head = git::rev_parse(&e.repo, "HEAD").unwrap();
     assert_eq!(base, head);
 }

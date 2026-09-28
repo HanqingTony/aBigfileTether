@@ -19,8 +19,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-/// 记录"真实文件夹当前对应提交"的本地引用。
-pub const BASE_REF: &str = "refs/tether/base";
+/// 每分支的 base 引用前缀（`refs/tether/base/<branch>`）。
+pub const BASE_REF_PREFIX: &str = "refs/tether/base";
+
+/// 当前分支的 base 引用。
+pub fn base_ref(repo: &Path) -> Result<String> {
+    let b = git::current_branch(repo).unwrap_or_else(|_| "HEAD".to_string());
+    Ok(format!("{BASE_REF_PREFIX}/{b}"))
+}
 
 /// 一次扫描的结果摘要。
 #[derive(Debug, Default, Serialize)]
@@ -53,8 +59,9 @@ fn fmt_ns(ns: i64) -> String {
 /// 扫描主入口。`fs` 为当前分支 `location` 对应的文件系统。
 pub fn scan(repo: &Path, fs: &dyn Fs, commit: bool) -> Result<ScanReport> {
     // 存在未应用的影子变更时禁止扫描
+    let bref = base_ref(repo)?;
     let head = git::rev_parse_opt(repo, "HEAD");
-    if let (Some(base), Some(head)) = (git::rev_parse_opt(repo, BASE_REF), head.as_ref())
+    if let (Some(base), Some(head)) = (git::rev_parse_opt(repo, &bref), head.as_ref())
         && &base != head
     {
         bail!(
@@ -241,7 +248,7 @@ pub fn scan(repo: &Path, fs: &dyn Fs, commit: bool) -> Result<ScanReport> {
 
     write_cert_scan(fs, &new_hash, &real_files)?;
     if let Some(head) = git::rev_parse_opt(repo, "HEAD") {
-        git::update_ref(repo, BASE_REF, &head)?;
+        git::update_ref(repo, &bref, &head)?;
     }
     Ok(report)
 }

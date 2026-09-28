@@ -5,7 +5,6 @@
 use crate::fs::Fs;
 use crate::git;
 use crate::model::Shadow;
-use crate::scan::BASE_REF;
 use crate::shadow as shadowmod;
 use crate::walk;
 use anyhow::{Context, Result};
@@ -36,8 +35,9 @@ pub fn apply(
     prune: bool,
     dry_run: bool,
 ) -> Result<ApplyReport> {
-    let base = git::rev_parse_opt(repo, BASE_REF)
-        .context("缺少 refs/tether/base：请先 `tether scan` 建立基线")?;
+    let bref = crate::scan::base_ref(repo)?;
+    let base =
+        git::rev_parse_opt(repo, &bref).context("缺少本分支 base：请先 `tether scan` 建立基线")?;
     let target_ref = to.unwrap_or_else(|| "HEAD".to_string());
     let target = git::rev_parse(repo, &target_ref)?;
 
@@ -180,7 +180,7 @@ pub fn apply(
     }
 
     if !dry_run && report.conflicts == 0 && report.need_pull == 0 {
-        git::update_ref(repo, BASE_REF, &target)?;
+        git::update_ref(repo, &bref, &target)?;
         report.applied = true;
     }
     Ok(report)

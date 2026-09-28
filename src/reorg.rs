@@ -5,7 +5,6 @@
 
 use crate::fs::Fs;
 use crate::git;
-use crate::scan::BASE_REF;
 use crate::shadow as shadowmod;
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -99,7 +98,7 @@ pub fn reorg(
         git::add_all(repo, shadowmod::MIRROR_DIR)?;
         report.committed = git::commit(repo, "tether reorg: 按映射整理目录")?;
         if let Some(head) = git::rev_parse_opt(repo, "HEAD") {
-            git::update_ref(repo, BASE_REF, &head)?;
+            git::update_ref(repo, &crate::scan::base_ref(repo)?, &head)?;
         }
         if report.committed {
             report.commit = git::rev_parse_opt(repo, "HEAD");
